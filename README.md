@@ -19,8 +19,20 @@ This system employs several agents working together:
 13. Sentiment Agent - Analyzes market sentiment and generates trading signals
 14. Fundamentals Agent - Analyzes fundamental data and generates trading signals
 15. Technicals Agent - Analyzes technical indicators and generates trading signals
-16. Risk Manager - Calculates risk metrics and sets position limits
-17. Portfolio Manager - Makes final trading decisions and generates orders
+
+In addition to these globally-focused agents, a specialized suite of agents is available for A-Share (Chinese stock market) analysis:
+
+16. **Policy Analysis Agent (A-Share)** - Parses and assesses the impact of Chinese government policies, outputting a Policy Heat Index.
+17. **Industry Rotation Agent (A-Share)** - Conducts momentum analysis on Shenwan primary industries, suggesting top 3 for allocation.
+18. **Northbound Capital Agent (A-Share)** - Monitors capital flows via the Shanghai-Shenzhen-Hong Kong Stock Connect, issuing warnings for anomalies.
+19. **ST Stock Agent (A-Share)** - Quantifies delisting risks for ST (Special Treatment) stocks and estimates cap removal probabilities.
+
+These A-Share agents can be selected alongside or independently of the global agents to tailor the analysis.
+
+Finally, the system includes overarching managers:
+
+20. Risk Manager - Calculates risk metrics and sets position limits.
+21. Portfolio Manager - Makes final trading decisions and generates orders.
     
 <img width="1042" alt="Screenshot 2025-03-22 at 6 19 07 PM" src="https://github.com/user-attachments/assets/cbae3dcf-b571-490d-b0ad-3f0f035ac0d4" />
 

@@ -16,6 +16,12 @@ from src.agents.valuation import valuation_analyst_agent
 from src.agents.warren_buffett import warren_buffett_agent
 from src.agents.rakesh_jhunjhunwala import rakesh_jhunjhunwala_agent
 
+# A-Share Specific Agent Node Imports
+from src.agents.policy_analysis_agent import policy_analysis_agent_node
+from src.agents.industry_rotation_agent import industry_rotation_agent_node
+from src.agents.northbound_capital_agent import northbound_capital_agent_node
+from src.agents.st_stock_agent import st_stock_agent_node
+
 # Define analyst configuration - single source of truth
 ANALYST_CONFIG = {
     "aswath_damodaran": {
@@ -107,6 +113,31 @@ ANALYST_CONFIG = {
         "description": "Company Valuation Specialist",
         "agent_func": valuation_analyst_agent,
         "order": 14,
+    },
+    # A-Share Specific Agents
+    "policy_analysis": {
+        "display_name": "Policy Analysis (A-Share)",
+        "description": "Analyzes government policies for A-Share market impact.",
+        "agent_func": policy_analysis_agent_node,
+        "order": 15,
+    },
+    "industry_rotation": {
+        "display_name": "Industry Rotation (A-Share)",
+        "description": "Suggests TOP3 industries based on Shenwan momentum.",
+        "agent_func": industry_rotation_agent_node,
+        "order": 16,
+    },
+    "northbound_capital": {
+        "display_name": "Northbound Capital (A-Share)",
+        "description": "Monitors HKEX/ChinaClear capital flows.",
+        "agent_func": northbound_capital_agent_node,
+        "order": 17,
+    },
+    "st_stock_analysis": {
+        "display_name": "ST Stock Analysis (A-Share)",
+        "description": "Assesses delisting risk for ST stocks.",
+        "agent_func": st_stock_agent_node,
+        "order": 18,
     },
 }
 
