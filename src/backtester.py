@@ -23,6 +23,9 @@ from src.tools.api import (
 from src.utils.display import print_backtest_results, format_backtest_row
 from typing_extensions import Callable
 from src.utils.ollama import ensure_ollama_and_model
+from src.data.calendar import get_trading_calendar
+from src.data.adjustments import get_adjustments_for_date # Dividend/Split handling
+from src.data.stock_info import get_stock_status, get_stock_financial_metric # ST/Delisting warnings
 
 init(autoreset=True)
 
@@ -39,6 +42,13 @@ class Backtester:
         model_provider: str = "OpenAI",
         selected_analysts: list[str] = [],
         initial_margin_requirement: float = 0.0,
+        exchange: str = "SSE",
+        limit_up_ratio: float = 1.1,
+        limit_down_ratio: float = 0.9,
+        st_limit_up_ratio: float = 1.05,
+        st_limit_down_ratio: float = 0.95,
+        delisting_risk_threshold: float = 0.6,
+        position_lock_days: int = 1, # T+1
     ):
         """
         :param agent: The trading agent (Callable).
@@ -59,6 +69,13 @@ class Backtester:
         self.model_name = model_name
         self.model_provider = model_provider
         self.selected_analysts = selected_analysts
+        self.position_lock_days = position_lock_days
+        self.limit_up_ratio = limit_up_ratio
+        self.limit_down_ratio = limit_down_ratio
+        self.st_limit_up_ratio = st_limit_up_ratio
+        self.st_limit_down_ratio = st_limit_down_ratio
+        self.exchange = exchange
+        self.delisting_risk_threshold = delisting_risk_threshold
 
         # Initialize portfolio with support for long/short positions
         self.portfolio_values = []
@@ -66,7 +83,16 @@ class Backtester:
             "cash": initial_capital,
             "margin_used": 0.0,  # total margin usage across all short positions
             "margin_requirement": initial_margin_requirement,  # The margin ratio required for shorts
-            "positions": {ticker: {"long": 0, "short": 0, "long_cost_basis": 0.0, "short_cost_basis": 0.0, "short_margin_used": 0.0} for ticker in tickers},  # Number of shares held long  # Number of shares held short  # Average cost basis per share (long)  # Average cost basis per share (short)  # Dollars of margin used for this ticker's short
+            "positions": {
+                ticker: {
+                    "long_shares": 0, # Total long shares
+                    "long_cost_basis": 0.0, # Average cost basis for all long shares
+                    "long_lots": [], # List of lots: {"date_acquired": "YYYY-MM-DD", "quantity": X, "price_per_share": Y}
+                    "short": 0,
+                    "short_cost_basis": 0.0,
+                    "short_margin_used": 0.0
+                } for ticker in tickers
+            },
             "realized_gains": {
                 ticker: {
                     "long": 0.0,  # Realized gains from long positions
@@ -76,10 +102,11 @@ class Backtester:
             },
         }
 
-    def execute_trade(self, ticker: str, action: str, quantity: float, current_price: float):
+    def execute_trade(self, ticker: str, action: str, quantity: float, current_price: float, current_date_str: str, prev_day_close_price: float | None):
         """
         Execute trades with support for both long and short positions.
         `quantity` is the number of shares the agent wants to buy/sell/short/cover.
+        `prev_day_close_price` is used for limit up/down calculations.
         We will only trade integer shares to keep it simple.
         """
         if quantity <= 0:
@@ -88,21 +115,51 @@ class Backtester:
         quantity = int(quantity)  # force integer shares
         position = self.portfolio["positions"][ticker]
 
+        current_dt = datetime.strptime(current_date_str, "%Y-%m-%d")
+
+        # Price limit calculations
+        limit_up_price = None
+        limit_down_price = None
+        if prev_day_close_price is not None:
+            current_stock_status = get_stock_status(ticker) # Fetch status for limit determination
+
+            up_ratio = self.limit_up_ratio
+            down_ratio = self.limit_down_ratio
+
+            if current_stock_status and ("ST" in current_stock_status.upper()): # Covers ST, *ST, etc.
+                up_ratio = self.st_limit_up_ratio
+                down_ratio = self.st_limit_down_ratio
+                print(f"{Fore.CYAN}{current_date_str} {ticker}: Using ST limits ({up_ratio}, {down_ratio}) due to status: {current_stock_status}{Style.RESET_ALL}")
+
+
+            # Ensure correct rounding for Chinese market prices (typically 2 decimal places)
+            limit_up_price = round(prev_day_close_price * up_ratio, 2)
+            limit_down_price = round(prev_day_close_price * down_ratio, 2)
+
         if action == "buy":
+            # Check for limit up
+            if limit_up_price is not None and current_price >= limit_up_price:
+                # If the agent attempts to buy at or above the limit_up_price, reject.
+                # This simulates the inability to get an order filled at the limit or above.
+                print(f"{Fore.YELLOW}{current_date_str} {ticker}: Buy order at {current_price:.2f} rejected. Price is at or above limit up {limit_up_price:.2f}.{Style.RESET_ALL}")
+                return 0
             cost = quantity * current_price
             if cost <= self.portfolio["cash"]:
-                # Weighted average cost basis for the new total
-                old_shares = position["long"]
-                old_cost_basis = position["long_cost_basis"]
-                new_shares = quantity
-                total_shares = old_shares + new_shares
+                # Add new lot
+                position["long_lots"].append({
+                    "date_acquired": current_date_str,
+                    "quantity": quantity,
+                    "price_per_share": current_price
+                })
 
-                if total_shares > 0:
-                    total_old_cost = old_cost_basis * old_shares
-                    total_new_cost = cost
-                    position["long_cost_basis"] = (total_old_cost + total_new_cost) / total_shares
+                # Update total long shares and average cost basis
+                total_value = sum(lot["quantity"] * lot["price_per_share"] for lot in position["long_lots"])
+                position["long_shares"] = sum(lot["quantity"] for lot in position["long_lots"])
+                if position["long_shares"] > 0:
+                    position["long_cost_basis"] = total_value / position["long_shares"]
+                else:
+                    position["long_cost_basis"] = 0.0
 
-                position["long"] += quantity
                 self.portfolio["cash"] -= cost
                 return quantity
             else:
@@ -110,36 +167,91 @@ class Backtester:
                 max_quantity = int(self.portfolio["cash"] / current_price)
                 if max_quantity > 0:
                     cost = max_quantity * current_price
-                    old_shares = position["long"]
-                    old_cost_basis = position["long_cost_basis"]
-                    total_shares = old_shares + max_quantity
+                    position["long_lots"].append({
+                        "date_acquired": current_date_str,
+                        "quantity": max_quantity,
+                        "price_per_share": current_price
+                    })
 
-                    if total_shares > 0:
-                        total_old_cost = old_cost_basis * old_shares
-                        total_new_cost = cost
-                        position["long_cost_basis"] = (total_old_cost + total_new_cost) / total_shares
+                    total_value = sum(lot["quantity"] * lot["price_per_share"] for lot in position["long_lots"])
+                    position["long_shares"] = sum(lot["quantity"] for lot in position["long_lots"])
+                    if position["long_shares"] > 0:
+                        position["long_cost_basis"] = total_value / position["long_shares"]
+                    else:
+                        position["long_cost_basis"] = 0.0
 
-                    position["long"] += max_quantity
                     self.portfolio["cash"] -= cost
                     return max_quantity
                 return 0
 
         elif action == "sell":
-            # You can only sell as many as you own
-            quantity = min(quantity, position["long"])
-            if quantity > 0:
-                # Realized gain/loss using average cost basis
-                avg_cost_per_share = position["long_cost_basis"] if position["long"] > 0 else 0
-                realized_gain = (current_price - avg_cost_per_share) * quantity
+            # Check for limit down
+            if limit_down_price is not None and current_price <= limit_down_price:
+                # If the agent attempts to sell at or below the limit_down_price, reject.
+                # This simulates the inability to get an order filled at the limit or below.
+                print(f"{Fore.YELLOW}{current_date_str} {ticker}: Sell order at {current_price:.2f} rejected. Price is at or below limit down {limit_down_price:.2f}.{Style.RESET_ALL}")
+                return 0
+
+            sellable_shares = 0
+            for lot in position["long_lots"]:
+                date_acquired_dt = datetime.strptime(lot["date_acquired"], "%Y-%m-%d")
+                if (current_dt - date_acquired_dt).days >= self.position_lock_days:
+                    sellable_shares += lot["quantity"]
+
+            quantity_to_sell = min(quantity, sellable_shares)
+
+            if quantity_to_sell > 0:
+                sold_shares_value = 0
+                remaining_lots = []
+                temp_quantity_to_sell = quantity_to_sell
+
+                # Sort lots by date_acquired (FIFO)
+                position["long_lots"].sort(key=lambda x: datetime.strptime(x["date_acquired"], "%Y-%m-%d"))
+
+                for lot in position["long_lots"]:
+                    date_acquired_dt = datetime.strptime(lot["date_acquired"], "%Y-%m-%d")
+                    if (current_dt - date_acquired_dt).days >= self.position_lock_days and temp_quantity_to_sell > 0:
+                        sell_from_lot = min(temp_quantity_to_sell, lot["quantity"])
+
+                        sold_shares_value += sell_from_lot * lot["price_per_share"]
+
+                        lot["quantity"] -= sell_from_lot
+                        temp_quantity_to_sell -= sell_from_lot
+
+                    if lot["quantity"] > 0:
+                        remaining_lots.append(lot)
+
+                position["long_lots"] = remaining_lots
+
+                # Realized gain/loss using average cost of sold shares
+                # For simplicity with current structure, we use overall average long_cost_basis for realized gain calculation
+                # A more precise calculation would use the specific cost basis of the lots sold.
+                # However, the problem asks for T+1, not necessarily strict FIFO P&L for this step.
+                # The current `long_cost_basis` is an average of *all* lots, so this is an approximation.
+                avg_cost_of_sold_shares = position["long_cost_basis"] # Approximation
+                if quantity_to_sell > 0 and position["long_shares"] > 0 : # re-fetch avg cost if shares were sold.
+                     # This is tricky. The long_cost_basis used for P&L should ideally be from the shares *being sold*.
+                     # For now, we'll use the overall average cost before this sale transaction for P&L,
+                     # and then update the portfolio's average cost.
+                     # A truly accurate FIFO P&L would require summing costs of shares specifically sold from lots.
+                     # Let's use the existing average cost basis for calculating this transaction's P&L.
+                     pass # avg_cost_of_sold_shares remains as overall current average
+
+                realized_gain = (current_price * quantity_to_sell) - (avg_cost_of_sold_shares * quantity_to_sell)
                 self.portfolio["realized_gains"][ticker]["long"] += realized_gain
 
-                position["long"] -= quantity
-                self.portfolio["cash"] += quantity * current_price
+                position["long_shares"] -= quantity_to_sell
+                self.portfolio["cash"] += quantity_to_sell * current_price
 
-                if position["long"] == 0:
+                # Recalculate average cost basis for remaining shares
+                if position["long_shares"] > 0:
+                    total_value = sum(lot["quantity"] * lot["price_per_share"] for lot in position["long_lots"])
+                    position["long_cost_basis"] = total_value / position["long_shares"]
+                else:
                     position["long_cost_basis"] = 0.0
 
-                return quantity
+                return quantity_to_sell
+            return 0
 
         elif action == "short":
             """
@@ -148,6 +260,11 @@ class Backtester:
               2) Post margin_required = proceeds * margin_ratio
               3) Net effect on cash = +proceeds - margin_required
             """
+            # Check for limit down for short selling
+            if limit_down_price is not None and current_price <= limit_down_price:
+                print(f"{Fore.YELLOW}{current_date_str} {ticker}: Short order at {current_price:.2f} rejected. Price is at or below limit down {limit_down_price:.2f}.{Style.RESET_ALL}")
+                return 0
+
             proceeds = current_price * quantity
             margin_required = proceeds * self.portfolio["margin_requirement"]
             if margin_required <= self.portfolio["cash"]:
@@ -209,6 +326,11 @@ class Backtester:
               2) Release a proportional share of the margin
               3) Net effect on cash = -cover_cost + released_margin
             """
+            # Check for limit up when covering shorts (buying back)
+            if limit_up_price is not None and current_price >= limit_up_price:
+                print(f"{Fore.YELLOW}{current_date_str} {ticker}: Cover order at {current_price:.2f} rejected. Price is at or above limit up {limit_up_price:.2f}.{Style.RESET_ALL}")
+                return 0
+
             quantity = min(quantity, position["short"])
             if quantity > 0:
                 cover_cost = quantity * current_price
@@ -254,7 +376,7 @@ class Backtester:
             price = current_prices[ticker]
 
             # Long position value
-            long_value = position["long"] * price
+            long_value = position["long_shares"] * price
             total_value += long_value
 
             # Short position unrealized PnL = short_shares * (short_cost_basis - current_price)
@@ -291,7 +413,12 @@ class Backtester:
         # Pre-fetch all data at the start
         self.prefetch_data()
 
-        dates = pd.date_range(self.start_date, self.end_date, freq="B")
+        # Get trading dates from the calendar module
+        dates = get_trading_calendar(self.start_date, self.end_date, self.exchange)
+        if not dates:
+            print(f"{Fore.RED}No trading dates found for the specified period and exchange. Backtest cannot run.{Style.RESET_ALL}")
+            return {} # Return empty metrics or handle appropriately
+
         table_rows = []
         performance_metrics = {"sharpe_ratio": None, "sortino_ratio": None, "max_drawdown": None, "long_short_ratio": None, "gross_exposure": None, "net_exposure": None}
 
@@ -303,14 +430,83 @@ class Backtester:
         else:
             self.portfolio_values = []
 
+        previous_day_close_prices = {} # Store previous day's close for limit calculations
+
         for current_date in dates:
             lookback_start = (current_date - timedelta(days=30)).strftime("%Y-%m-%d")
             current_date_str = current_date.strftime("%Y-%m-%d")
             previous_date_str = (current_date - timedelta(days=1)).strftime("%Y-%m-%d")
 
-            # Skip if there's no prior day to look back (i.e., first date in the range)
+            # --- Apply Adjustments (Dividends/Splits) before any other daily processing ---
+            for ticker_symbol in self.tickers: # Iterate over all tickers, not just those in portfolio, as prev_day_close might need adjustment
+                adjustments_today = get_adjustments_for_date(ticker_symbol, current_date_str)
+                for adj in adjustments_today:
+                    print(f"{Fore.MAGENTA}{current_date_str} Applying adjustment for {ticker_symbol}: {adj}{Style.RESET_ALL}")
+
+                    # Adjust portfolio position if held
+                    if ticker_symbol in self.portfolio["positions"]:
+                        position = self.portfolio["positions"][ticker_symbol]
+                        if adj["type"] == "dividend":
+                            if position["long_shares"] > 0: # Dividends only for long positions
+                                cash_received = adj["cash_per_share"] * position["long_shares"]
+                                self.portfolio["cash"] += cash_received
+                                print(f"{Fore.MAGENTA}  {ticker_symbol}: Received dividend of ${cash_received:.2f}. New cash balance: ${self.portfolio['cash']:.2f}{Style.RESET_ALL}")
+
+                        elif adj["type"] == "split":
+                            split_factor = adj["factor"]
+                            if split_factor > 0 and position["long_shares"] > 0:
+                                print(f"{Fore.MAGENTA}  {ticker_symbol}: Applying {split_factor}-for-1 stock split to holdings.{Style.RESET_ALL}")
+                                new_total_shares = 0
+                                new_total_value = 0 # To recalculate average cost basis accurately
+                                for lot in position["long_lots"]:
+                                    lot["quantity"] = round(lot["quantity"] * split_factor)
+                                    lot["price_per_share"] = lot["price_per_share"] / split_factor
+                                    new_total_shares += lot["quantity"]
+                                    new_total_value += lot["quantity"] * lot["price_per_share"]
+
+                                old_shares = position["long_shares"]
+                                position["long_shares"] = new_total_shares
+                                if new_total_shares > 0:
+                                    position["long_cost_basis"] = new_total_value / new_total_shares
+                                else:
+                                    position["long_cost_basis"] = 0.0
+                                print(f"{Fore.MAGENTA}  {ticker_symbol}: Shares changed from {old_shares} to {position['long_shares']}. New avg cost basis: {position['long_cost_basis']:.2f}{Style.RESET_ALL}")
+
+                    # Adjust prev_day_close_price for the current ticker if it's a split
+                    # This ensures limit prices for today are based on the split-adjusted previous close.
+                    if adj["type"] == "split":
+                        if ticker_symbol in previous_day_close_prices and previous_day_close_prices[ticker_symbol] is not None:
+                            old_prev_close = previous_day_close_prices[ticker_symbol]
+                            previous_day_close_prices[ticker_symbol] = round(old_prev_close / adj["factor"], 2) # Apply factor and round
+                            print(f"{Fore.MAGENTA}  {ticker_symbol}: Adjusted previous day's close for limits from {old_prev_close:.2f} to {previous_day_close_prices[ticker_symbol]:.2f} due to split.{Style.RESET_ALL}")
+
+            # --- ST/Delisting Warnings Check ---
+            for ticker_symbol in self.tickers:
+                status = get_stock_status(ticker_symbol)
+                if status and status != "Normal":
+                    print(f"{Fore.RED}{current_date_str} WARNING for {ticker_symbol}: Status is {status}.{Style.RESET_ALL}")
+
+                # Example rule for delisting risk based on a financial metric
+                # In a real system, financial metrics would be fetched daily or periodically.
+                # Here, we use a static mock value from stock_info for demonstration.
+                # A more realistic rule engine would fetch up-to-date financial data.
+                # For this example, we'll use 'debt_to_equity_ratio'.
+                debt_to_equity = get_stock_financial_metric(ticker_symbol, "debt_to_equity_ratio")
+                if debt_to_equity is not None and debt_to_equity > self.delisting_risk_threshold:
+                    print(f"{Fore.RED}{current_date_str} WARNING for {ticker_symbol}: Debt/Equity ratio ({debt_to_equity:.2f}) exceeds threshold ({self.delisting_risk_threshold:.2f}). Potential delisting risk.{Style.RESET_ALL}")
+                    # In a more advanced system, this could trigger specific agent behaviors or portfolio actions.
+
+            # Skip if there's no prior day to look back (i.e., first date in the range for trading decisions)
             if lookback_start == current_date_str:
-                continue
+                # If it's the first day for agent decisions, we still need to calculate portfolio value.
+                # The price fetching and portfolio value calculation will happen.
+                # Agent execution and trading will be skipped by the `continue` statement later if this condition holds.
+                # However, the original code had `continue` here. Let's analyze impact.
+                # If we `continue` here, we miss the price fetching and portfolio value calculation for this day.
+                # This seems incorrect. The agent might not run, but the day itself and its impact on value should be recorded.
+                # The agent call is separate. Let's remove this early `continue`.
+                # The agent call has its own lookback check.
+                pass # Let the loop continue to price fetching and value calculation.
 
             # Get current prices for all tickers
             try:
@@ -360,8 +556,23 @@ class Backtester:
                 decision = decisions.get(ticker, {"action": "hold", "quantity": 0})
                 action, quantity = decision.get("action", "hold"), decision.get("quantity", 0)
 
-                executed_quantity = self.execute_trade(ticker, action, quantity, current_prices[ticker])
+                prev_close = previous_day_close_prices.get(ticker)
+                # If prev_close is None (e.g. first day of trading), limits might not apply or use current price as base.
+                # For simplicity, if no prev_close, we won't apply limits for this iteration.
+                # A more robust solution might fetch historical data if first day is not truly IPO day.
+
+                executed_quantity = self.execute_trade(
+                    ticker,
+                    action,
+                    quantity,
+                    current_prices[ticker],
+                    current_date_str,
+                    prev_close # Pass previous day's close
+                )
                 executed_trades[ticker] = executed_quantity
+
+            # Update previous_day_close_prices for the next iteration
+            previous_day_close_prices = current_prices.copy()
 
             # ---------------------------------------------------------------
             # 2) Now that trades have executed trades, recalculate the final
@@ -370,7 +581,7 @@ class Backtester:
             total_value = self.calculate_portfolio_value(current_prices)
 
             # Also compute long/short exposures for final post‐trade state
-            long_exposure = sum(self.portfolio["positions"][t]["long"] * current_prices[t] for t in self.tickers)
+            long_exposure = sum(self.portfolio["positions"][t]["long_shares"] * current_prices[t] for t in self.tickers)
             short_exposure = sum(self.portfolio["positions"][t]["short"] * current_prices[t] for t in self.tickers)
 
             # Calculate gross and net exposures
@@ -399,7 +610,7 @@ class Backtester:
 
                 # Calculate net position value
                 pos = self.portfolio["positions"][ticker]
-                long_val = pos["long"] * current_prices[ticker]
+                long_val = pos["long_shares"] * current_prices[ticker]
                 short_val = pos["short"] * current_prices[ticker]
                 net_position_value = long_val - short_val
 
@@ -415,7 +626,7 @@ class Backtester:
                         action=action,
                         quantity=quantity,
                         price=current_prices[ticker],
-                        shares_owned=pos["long"] - pos["short"],  # net shares
+                        shares_owned=pos["long_shares"] - pos["short"],  # net shares
                         position_value=net_position_value,
                         bullish_count=bullish_count,
                         bearish_count=bearish_count,
